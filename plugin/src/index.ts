@@ -1,5 +1,7 @@
 import type { PluginInput, WorkspaceAdapter, WorkspaceInfo, WorkspaceTarget } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { appendFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { resolveConfig, type ResolvedPluginConfig } from "./config.js";
 import { LeaseManager } from "./leases.js";
 import { ProviderRegistry } from "./provider.js";
@@ -13,21 +15,26 @@ let sshManager: SSHManager;
 let providers: ProviderRegistry;
 
 function resolveProvider(workspace: WorkspaceInfo) {
-  if (!workspace.extra || typeof (workspace.extra as Record<string, unknown>).provider !== "string") {
-    throw new Error("Workspace extra.provider must be configured");
+  if (workspace.extra && typeof (workspace.extra as Record<string, unknown>).provider === "string") {
+    return providers.resolve({
+      provider: (workspace.extra as Record<string, unknown>).provider as string,
+      host: typeof (workspace.extra as Record<string, unknown>).host === "string"
+        ? ((workspace.extra as Record<string, unknown>).host as string)
+        : undefined,
+      labels: Array.isArray((workspace.extra as Record<string, unknown>).labels)
+        ? ((workspace.extra as Record<string, unknown>).labels as unknown[]).filter(
+            (value): value is string => typeof value === "string",
+          )
+        : undefined,
+    });
   }
 
-  return providers.resolve({
-    provider: (workspace.extra as Record<string, unknown>).provider as string,
-    host: typeof (workspace.extra as Record<string, unknown>).host === "string"
-      ? ((workspace.extra as Record<string, unknown>).host as string)
-      : undefined,
-    labels: Array.isArray((workspace.extra as Record<string, unknown>).labels)
-      ? ((workspace.extra as Record<string, unknown>).labels as unknown[]).filter(
-          (value): value is string => typeof value === "string",
-        )
-      : undefined,
-  });
+  const firstProvider = Object.keys(config.providers)[0];
+  if (!firstProvider) {
+    throw new Error("No providers configured for opencode-remote-provider");
+  }
+
+  return providers.resolve({ provider: firstProvider });
 }
 
 function configureWorkspace(workspace: WorkspaceInfo): WorkspaceInfo {
@@ -45,13 +52,76 @@ function configureWorkspace(workspace: WorkspaceInfo): WorkspaceInfo {
   };
 }
 
-async function createWorkspace(workspace: WorkspaceInfo): Promise<void> {
-  const selection = resolveProvider(workspace);
+async function registerWithStub(workspace: WorkspaceInfo, localPort: number, token: string): Promise<void> {
+  const body = JSON.stringify({
+    id: workspace.id,
+    type: workspace.type || "ssh-provider",
+    name: workspace.name || workspace.id,
+    projectID: workspace.projectID,
+    status: "ready",
+    extra: workspace.extra || { provider: "default" },
+  });
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        hostname: "127.0.0.1",
+        port: localPort,
+        path: "/experimental/workspace",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+          "Content-Length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        let data = "";
+        res.on("data", (chunk) => { data += chunk; });
+        res.on("end", () => {
+          if (res.statusCode === 200) resolve();
+          else reject(new Error(`stub register workspace failed: ${res.statusCode} ${data}`));
+        });
+      },
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
 
-  leases.acquire(selection.host.name, workspace.id, config.defaults.leaseMode);
+async function createWorkspace(workspace: WorkspaceInfo): Promise<void> {
+  const fs = await import("node:fs");
+  const log = (msg: string, data: string) => {
+    try {
+      const line = `${new Date().toISOString()} [createWorkspace] ${msg}: ${data}\n`;
+      fs.appendFileSync("/tmp/opencode-plugin-error.log", line);
+      process.stderr.write(line);
+    } catch {}
+  };
+
+  log("workspace received", JSON.stringify(workspace));
+
+  let selection;
+  try {
+    selection = resolveProvider(workspace);
+    log("selection", JSON.stringify(selection));
+  } catch (err) {
+    log("resolveProvider failed", err instanceof Error ? err.message : String(err));
+    throw err;
+  }
 
   try {
+    leases.acquire(selection.host.name, workspace.id, config.defaults.leaseMode);
+    log("leases.acquired", "ok");
+  } catch (err) {
+    log("leases.acquire failed", err instanceof Error ? err.message : String(err));
+    throw err;
+  }
+
+  try {
+    log("before bootstrap", "ok");
     const bootstrap = await sshManager.bootstrap(workspace.id, selection);
+    log("after bootstrap success", JSON.stringify({ remotePort: bootstrap.remotePort, localPort: bootstrap.localPort }));
 
     state.set({
       workspaceID: workspace.id,
@@ -63,7 +133,12 @@ async function createWorkspace(workspace: WorkspaceInfo): Promise<void> {
       leaseMode: config.defaults.leaseMode,
       status: "ready",
     });
+    log("state set done", "ok");
+
+    await registerWithStub(workspace, bootstrap.localPort, bootstrap.token);
+    log("stub register done", "ok");
   } catch (error) {
+    log("bootstrap failed", error instanceof Error ? error.message : String(error));
     leases.release(selection.host.name, workspace.id);
     throw error;
   }
@@ -81,18 +156,26 @@ async function removeWorkspace(workspace: WorkspaceInfo): Promise<void> {
 }
 
 function getTarget(workspace: WorkspaceInfo): WorkspaceTarget {
-  const binding = state.get(workspace.id);
-  if (!binding) {
-    throw new Error(`Workspace '${workspace.id}' is not active`);
+  try {
+    const binding = state.get(workspace.id);
+    if (!binding) {
+      appendFileSync("/tmp/opencode-plugin-error.log", `${new Date().toISOString()} [getTarget] NOT FOUND for ${workspace.id}\n`);
+      throw new Error(`Workspace '${workspace.id}' is not active`);
+    }
+    appendFileSync("/tmp/opencode-plugin-error.log", `${new Date().toISOString()} [getTarget] found binding localPort=${binding.localPort}\n`);
+    return {
+      type: "remote",
+      url: `http://127.0.0.1:${binding.localPort}`,
+      headers: {
+        Authorization: `Bearer ${binding.token}`,
+      },
+    };
+  } catch (err) {
+    try {
+      appendFileSync("/tmp/opencode-plugin-error.log", `${new Date().toISOString()} [getTarget] ERROR: ${err instanceof Error ? err.message : String(err)}\n`);
+    } catch {}
+    throw err;
   }
-
-  return {
-    type: "remote",
-    url: `http://127.0.0.1:${binding.localPort}`,
-    headers: {
-      Authorization: `Bearer ${binding.token}`,
-    },
-  };
 }
 
 const sshProviderAdaptor: WorkspaceAdapter = {
@@ -105,6 +188,11 @@ const sshProviderAdaptor: WorkspaceAdapter = {
 };
 
 export default async function OpencodeRemotePlugin(input: PluginInput, options?: Record<string, unknown>) {
+  const fs = await import("node:fs");
+  try {
+    fs.appendFileSync("/tmp/opencode-plugin-error.log", `${new Date().toISOString()} [init] plugin loading, experimental_workspace=${!!input.experimental_workspace}, options=${JSON.stringify(options)}\n`);
+  } catch {}
+
   if (!input.experimental_workspace) {
     throw new Error("[opencode-remote] experimental_workspace not available");
   }
@@ -112,7 +200,16 @@ export default async function OpencodeRemotePlugin(input: PluginInput, options?:
   config = resolveConfig((options as ResolvedPluginConfig | undefined) ?? { providers: {} });
   sshManager = new SSHManager(config);
   providers = new ProviderRegistry(config, leases);
+
+  try {
+    fs.appendFileSync("/tmp/opencode-plugin-error.log", `${new Date().toISOString()} [init] providers resolved: ${Object.keys(config.providers).length}\n`);
+  } catch {}
+
   input.experimental_workspace.register("ssh-provider", sshProviderAdaptor);
+
+  try {
+    fs.appendFileSync("/tmp/opencode-plugin-error.log", `${new Date().toISOString()} [init] registered ssh-provider adaptor\n`);
+  } catch {}
 
   return {
     tool: {
@@ -150,6 +247,11 @@ export default async function OpencodeRemotePlugin(input: PluginInput, options?:
                 leaseMode: config.defaults.leaseMode,
                 status: "ready",
               });
+              await registerWithStub(
+                { id: workspaceID, type: "ssh-provider", name: args.workspaceName, projectID: "" } as WorkspaceInfo,
+                bootstrap.localPort,
+                bootstrap.token,
+              );
             } catch (error) {
               leases.release(selection.host.name, workspaceID);
               throw error;

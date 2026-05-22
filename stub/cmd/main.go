@@ -64,6 +64,7 @@ func main() {
 
 	mux.HandleFunc("/global/health", require(h.Health))
 	mux.HandleFunc("/global/event", require(h.Events))
+	mux.HandleFunc("/sync/history", require(h.SyncHistory))
 	mux.HandleFunc("/experimental/workspace/adaptor", require(h.WorkspaceAdaptor))
 	mux.HandleFunc("/experimental/workspace", require(h.WorkspaceList))
 	mux.HandleFunc("/experimental/workspace/status", require(h.WorkspaceStatus))
@@ -80,6 +81,10 @@ func main() {
 			h.Command(w, r)
 			return
 		}
+		if strings.HasSuffix(path, "/message") {
+			h.Message(w, r)
+			return
+		}
 		if r.Method == http.MethodGet {
 			h.SessionGet(w, r)
 			return
@@ -88,7 +93,7 @@ func main() {
 			h.SessionDelete(w, r)
 			return
 		}
-		handler.Error(w, 405, "method_not_allowed", "GET, DELETE, /shell, or /command required")
+		handler.Error(w, 405, "method_not_allowed", "GET, DELETE, /shell, /command, or /message required")
 	}))
 	mux.HandleFunc("/permission", require(h.PermissionList))
 	mux.HandleFunc("/permission/", require(func(w http.ResponseWriter, r *http.Request) {

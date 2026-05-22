@@ -79,10 +79,20 @@ func Error(w http.ResponseWriter, code int, errType, message string) {
 	})
 }
 
+func (h *Handler) SyncHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		Error(w, 405, "method_not_allowed", "POST required")
+		return
+	}
+	JSON(w, 200, []interface{}{})
+}
+
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	hostname, _ := os.Hostname()
 	platform := "linux"
 	arch := "amd64"
+
+	log.Printf("[Health] workspaces=%d sessions=%d", len(h.st.ListWorkspaces()), len(h.st.ListSessions()))
 
 	JSON(w, 200, map[string]interface{}{
 		"ok":       true,
@@ -101,14 +111,15 @@ func (h *Handler) Events(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-
-	ch := h.events.Subscribe()
-	defer func() { <-ch }()
+	w.WriteHeader(http.StatusOK)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return
 	}
+	flusher.Flush()
+
+	ch := h.events.Subscribe()
 
 	notify := r.Context().Done()
 	for {
@@ -154,9 +165,11 @@ func (h *Handler) WorkspaceList(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		var ws state.Workspace
 		if err := json.NewDecoder(r.Body).Decode(&ws); err != nil {
+			log.Printf("[WorkspaceList POST] body decode error: %v", err)
 			Error(w, 400, "invalid_request", err.Error())
 			return
 		}
+		log.Printf("[WorkspaceList POST] registering workspace: id=%q type=%q name=%q projectID=%q host=%q", ws.ID, ws.Type, ws.Name, ws.ProjectID, ws.Host)
 		ws.Status = "ready"
 		ws.CreatedAt = time.Now().UnixMilli()
 		if ws.Extra == nil {
@@ -170,9 +183,11 @@ func (h *Handler) WorkspaceList(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := h.st.CreateWorkspace(&ws); err != nil {
+			log.Printf("[WorkspaceList POST] create error: %v", err)
 			Error(w, 500, "internal_error", err.Error())
 			return
 		}
+		log.Printf("[WorkspaceList POST] workspace %q registered OK", ws.ID)
 
 		h.events.Publish("workspace.ready", map[string]interface{}{
 			"workspaceID": ws.ID,
@@ -226,6 +241,8 @@ func WithWorkspaceRoutes(mux *http.ServeMux, require func(http.HandlerFunc) http
 }
 
 func (h *Handler) SessionCreate(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[SessionCreate] method=%s path=%s query=%s", r.Method, r.URL.Path, r.URL.RawQuery)
+
 	if r.Method != http.MethodPost {
 		Error(w, 405, "method_not_allowed", "POST required")
 		return
@@ -237,15 +254,47 @@ func (h *Handler) SessionCreate(w http.ResponseWriter, r *http.Request) {
 		WorkspaceID string `json:"workspaceID"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[SessionCreate] body decode error: %v", err)
 		Error(w, 400, "invalid_request", err.Error())
 		return
 	}
 
-	ws, ok := h.st.GetWorkspace(req.WorkspaceID)
-	if !ok {
+	log.Printf("[SessionCreate] body decoded: id=%q title=%q workspaceID=%q", req.ID, req.Title, req.WorkspaceID)
+
+	if req.WorkspaceID == "" {
+		req.WorkspaceID = r.URL.Query().Get("workspace")
+		log.Printf("[SessionCreate] fallback to query workspace=%q", req.WorkspaceID)
+	}
+
+	log.Printf("[SessionCreate] looking up workspace id=%q", req.WorkspaceID)
+	log.Printf("[SessionCreate] known workspaces: %v", func() []string {
+		var ids []string
+		for _, ws := range h.st.ListWorkspaces() {
+			ids = append(ids, ws.ID)
+		}
+		return ids
+	}())
+
+	var ws *state.Workspace
+	if req.WorkspaceID != "" {
+		ws, _ = h.st.GetWorkspace(req.WorkspaceID)
+	}
+	if ws == nil {
+		all := h.st.ListWorkspaces()
+		for _, w := range all {
+			ws = w
+		}
+	}
+	if ws == nil {
+		log.Printf("[SessionCreate] WORKSPACE NOT FOUND: %q (no workspaces at all)", req.WorkspaceID)
 		Error(w, 404, "not_found", "workspace not found")
 		return
 	}
+
+	req.WorkspaceID = ws.ID
+	log.Printf("[SessionCreate] resolved to workspace id=%q name=%q", ws.ID, ws.Name)
+
+	log.Printf("[SessionCreate] workspace found: id=%q type=%q name=%q", ws.ID, ws.Type, ws.Name)
 
 	home, _ := os.UserHomeDir()
 	sessionID := req.ID
@@ -299,9 +348,9 @@ func (h *Handler) SessionStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) SessionGet(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Path[len("/session/"):]
-	se, ok := h.st.GetSession(id)
-	if !ok {
-		Error(w, 404, "not_found", "session not found")
+	se := h.ensureSession(id)
+	if se == nil {
+		Error(w, 500, "internal_error", "failed to get or create session")
 		return
 	}
 
@@ -407,13 +456,38 @@ func (h *Handler) PermissionReply(w http.ResponseWriter, r *http.Request) {
 	JSON(w, 200, true)
 }
 
+func (h *Handler) ensureSession(id string) *state.Session {
+	se, ok := h.st.GetSession(id)
+	if ok {
+		return se
+	}
+	home, _ := os.UserHomeDir()
+	wsList := h.st.ListWorkspaces()
+	wsID := ""
+	if len(wsList) > 0 {
+		wsID = wsList[0].ID
+	}
+	se = &state.Session{
+		ID:          id,
+		WorkspaceID: wsID,
+		Directory:   home,
+		Status:      state.SessionStatus{Type: "idle"},
+		CreatedAt:   time.Now().UnixMilli(),
+		UpdatedAt:   time.Now().UnixMilli(),
+	}
+	if err := h.st.CreateSession(se); err != nil {
+		return nil
+	}
+	return se
+}
+
 func (h *Handler) Shell(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Path[len("/session/"):]
 	id = id[:len(id)-len("/shell")]
 
-	se, ok := h.st.GetSession(id)
-	if !ok {
-		Error(w, 404, "not_found", "session not found")
+	se := h.ensureSession(id)
+	if se == nil {
+		Error(w, 500, "internal_error", "failed to create session")
 		return
 	}
 
@@ -502,10 +576,44 @@ func runCommand(cmd, cwd string, env map[string]string) (string, int) {
 }
 
 func (h *Handler) Command(w http.ResponseWriter, r *http.Request) {
-	// TODO: implement
+	id := r.URL.Path[len("/session/"):]
+	id = id[:len(id)-len("/command")]
+
+	se := h.ensureSession(id)
+	if se == nil {
+		Error(w, 500, "internal_error", "failed to get or create session")
+		return
+	}
+
+	var req struct {
+		Command string `json:"command"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		Error(w, 400, "invalid_request", err.Error())
+		return
+	}
+
+	output, exitCode := runCommand(req.Command, se.Directory, nil)
+
 	JSON(w, 200, map[string]interface{}{
-		"title":   "placeholder",
-		"output":  "",
-		"metadata": map[string]interface{}{"exitCode": 0},
+		"title":   req.Command,
+		"output":  output,
+		"metadata": map[string]interface{}{
+			"exitCode": exitCode,
+			"cwd":      se.Directory,
+		},
+	})
+}
+
+func (h *Handler) Message(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Path[len("/session/"):]
+	id = id[:len(id)-len("/message")]
+
+	_ = h.ensureSession(id)
+
+	JSON(w, 200, map[string]interface{}{
+		"id":    fmt.Sprintf("msg_%d", time.Now().UnixMilli()),
+		"role":  "assistant",
+		"parts": []interface{}{},
 	})
 }

@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
-import { existsSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import type { ResolvedPluginConfig } from "./config.js";
 import type { ResolvedHost, WorkspaceBinding } from "./types.js";
@@ -25,7 +25,7 @@ export class SSHManager {
     const identityFile = sshConfig.identityFile
       ? sshConfig.identityFile.replace(/^~\//, `${process.env.HOME}/`)
       : undefined;
-    const remotePort = this.config.defaults.stubPort;
+    const remotePort = this.allocateRemotePort(workspaceID, target.host.name);
     const localPort = this.allocateLocalPort(workspaceID, target.host.name);
     const remoteHome = await this.resolveRemoteHome(sshConfig, identityFile);
     const installRoot = this.expandInstallRoot(remoteHome);
@@ -34,25 +34,21 @@ export class SSHManager {
     const stubBinary = `${installRoot}/bin/opencode-remote-stub`;
     const tokenFile = `${installRoot}/run/stub.token`;
     const stubPath = `${process.cwd()}/../stub/bin/opencode-remote-stub`;
-    const tokenPath = `/tmp/opencode-remote-token-${workspaceID}`;
 
-    await this.execSSH(sshArgs, `mkdir -p ${installRoot}/bin ${installRoot}/run ${installRoot}/log ${installRoot}/state`);
+    const wsStateDir = `${installRoot}/state/${workspaceID}`;
+
+    // Combined SSH call: setup dirs, kill ONLY our old stub, write token
+    await this.execSSH(sshArgs, [
+      `mkdir -p ${installRoot}/bin ${installRoot}/run ${wsStateDir}/workspaces ${wsStateDir}/sessions ${wsStateDir}/approvals ${installRoot}/log`,
+      `fuser -k ${remotePort}/tcp 2>/dev/null || true`,
+      `printf '%s' '${token}' > ${tokenFile}`,
+    ].join(" && "));
 
     if (existsSync(stubPath)) {
       await this.scp(stubPath, sshConfig, identityFile, `${sshConfig.user}@${sshConfig.host}:${stubBinary}`);
-      await this.execSSH(sshArgs, `chmod +x ${stubBinary}`);
     }
 
-    writeFileSync(tokenPath, token);
-    try {
-      await this.scp(tokenPath, sshConfig, identityFile, `${sshConfig.user}@${sshConfig.host}:${tokenFile}`);
-    } finally {
-      unlinkSync(tokenPath);
-    }
-
-    await this.execSSHAllowFailure(sshArgs, "pkill -f 'opencode-remote-stub' 2>/dev/null || true");
-    await this.execSSH(sshArgs, `mkdir -p ${installRoot}/log`);
-    await this.execSSH(sshArgs, this.buildRemoteStartCommand(installRoot, remotePort));
+    await this.execSSH(sshArgs, this.buildRemoteStartCommand(installRoot, remotePort, wsStateDir));
 
     await this.ensureTunnel(sshConfig, identityFile, localPort, remotePort);
     await this.waitForHealth(localPort, token);
@@ -63,7 +59,7 @@ export class SSHManager {
       token,
       installRoot,
       remoteHome,
-      launchCommand: this.buildLaunchCommand(installRoot, remotePort),
+      launchCommand: this.buildLaunchCommand(installRoot, remotePort, wsStateDir),
       healthURL: `http://127.0.0.1:${localPort}/global/health`,
     };
   }
@@ -249,14 +245,23 @@ export class SSHManager {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  private allocateLocalPort(workspaceID: string, host: string): number {
-    const [start, end] = this.config.tunnel.localPortRange;
+  private hashPort(workspaceID: string, host: string, start: number, end: number): number {
     const seed = `${workspaceID}:${host}`;
     let hash = 0;
     for (const char of seed) {
       hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
     }
     return start + (hash % (end - start + 1));
+  }
+
+  private allocateRemotePort(workspaceID: string, host: string): number {
+    const base = this.config.defaults.stubPort;
+    return this.hashPort(workspaceID, host, base, base + 200);
+  }
+
+  private allocateLocalPort(workspaceID: string, host: string): number {
+    const [start, end] = this.config.tunnel.localPortRange;
+    return this.hashPort(workspaceID, host, start, end);
   }
 
   private expandInstallRoot(remoteHome: string): string {
@@ -266,27 +271,27 @@ export class SSHManager {
     return this.config.installRoot;
   }
 
-  private buildLaunchCommand(installRoot: string, remotePort: number): string {
+  private buildLaunchCommand(installRoot: string, remotePort: number, wsStateDir: string): string {
     return [
       `${installRoot}/bin/opencode-remote-stub`,
       `--listen 127.0.0.1:${remotePort}`,
       `--token-file ${installRoot}/run/stub.token`,
-      `--state-dir ${installRoot}/state`,
+      `--state-dir ${wsStateDir}`,
       `--log-file ${installRoot}/log/stub.log`,
     ].join(" ");
   }
 
-  private buildRemoteStartCommand(installRoot: string, remotePort: number): string {
+  private buildRemoteStartCommand(installRoot: string, remotePort: number, wsStateDir: string): string {
     return [
-      "python2 - <<'PY' 2>/dev/null || python - <<'PY'",
+      "python3 - <<'PY' 2>/dev/null || python - <<'PY'",
       "import subprocess",
       "import time",
       "import sys",
       "null_in = open('/dev/null', 'rb')",
       "null_out = open('/dev/null', 'ab')",
-      `cmd = ['${installRoot}/bin/opencode-remote-stub', '--listen', '127.0.0.1:${remotePort}', '--token-file', '${installRoot}/run/stub.token', '--state-dir', '${installRoot}/state', '--log-file', '${installRoot}/log/stub.log']`,
-      "proc = subprocess.Popen(cmd, stdin=null_in, stdout=null_out, stderr=null_out, close_fds=True)",
-      "time.sleep(2)",
+      `cmd = ['${installRoot}/bin/opencode-remote-stub', '--listen', '127.0.0.1:${remotePort}', '--token-file', '${installRoot}/run/stub.token', '--state-dir', '${wsStateDir}', '--log-file', '${installRoot}/log/stub.log']`,
+      "proc = subprocess.Popen(cmd, stdin=null_in, stdout=null_out, stderr=null_out, close_fds=True, start_new_session=True)",
+      "time.sleep(1)",
       "sys.exit(0 if proc.poll() is None else 1)",
       "PY",
     ].join("\n");
